@@ -1,0 +1,615 @@
+{# comment 
+Address Lookup Module (Modal + Inline)
+This module fetches HubDB rows server-side using hubdb_table_rows.
+Table ID is taken from module field hubdb_table_id (default 141028126).
+ endcomment #}
+
+{% set ns = namespace(hubdb_rows=[]) %}
+
+{% for item in module.select_hubdb_tables %}
+  {% if item.hubdbtable_field %}
+    {% set rows = hubdb_table_rows(item.hubdbtable_field, "limit=10000", true) %}
+    {% set ns.hubdb_rows = ns.hubdb_rows + rows %}
+  {% endif %}
+{% endfor %}
+
+{# {{ ns.hubdb_rows }} #}
+
+{# Convert to JSON for client-side search. We will only map required fields. #}
+{% set normalized = [] %}
+{% for r in ns.hubdb_rows %}
+{% set row_obj = {
+      "clli": (r.clli|default("") ),
+      "addressstatus": (r.addressstatus|default("") ),
+      "normalizedaddress": (r.normalizedaddress|default("") ),
+      "streetaddress": (r.streetaddress|default("") ),
+      "house_number": (r.house_number|default("") ),
+      "unitnumber": (r.unitnumber|default("") ),
+      "street_direction": (r.street_direction|default("") ),
+      "street_suffix": (r.street_suffix|default("") ),
+      "city": (r.city|default("") ),
+      "state": (r.state|default("") ),
+      "zipcode": (r.zipcode|default("") ),
+      "groupid": (r.groupid|default("") )
+    }
+  %}
+{% do normalized.append(row_obj) %}
+{% endfor %}
+{# {{ normalized }} #}
+
+<div class="lmg-address-lookup-module {{name}}">
+  <div class="page-center">
+    {% if !module.show_inline %}
+    <div class="lmg-hero">    
+      <div class="buttons">
+        {% if module.buttons.button_label %}
+        <div>
+          {% set href = module.buttons.link.url.href %}
+          {% if module.buttons.link.url.type is equalto "EMAIL_ADDRESS" %}
+          {% set href = "mailto:" + href %}
+          {% elif module.buttons.link.url.type is equalto "PHONE_NUMBER" %}
+          {% set href = "tel:" + href %}
+          {% endif %}
+          <a class="lmg-btn pwr-cta_button first-btn" 
+             {% if module.buttons.link.url.type is equalto "CALL_TO_ACTION"  %}
+             href="{{ href }}" {# The href here is not escaped as it is not editable and functions as a JavaScript call to the associated CTA #}
+             {% else %}
+             href="{{ href|escape_url }}"
+             {% endif %}
+             {% if module.buttons.link.open_in_new_tab %}
+             target="_blank"
+             {% endif %}
+             {% if module.buttons.link.rel %}
+             rel="{{ module.buttons.link.rel|escape_attr }}"
+             {% endif %}
+             >
+            {{ module.buttons.button_label }}
+          </a>
+        </div>
+        {% endif %}
+        <button class="lmg-btn custom-btn lmg-btn pwr-cta_button" id="lmgOpenModal">{{ module.button_label }}</button>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if module.show_inline %}
+    <div class="lmg-inline-search">
+      <div class="lmg-input">
+        <input id="lmgInlineInput" placeholder="{{ module.input_placeholder }}" aria-label="Address search" />
+      </div>
+      <button class="lmg-btn custom-btn" id="lmgInlineBtn">{{ module.button_label }}</button>
+    </div>
+
+    <div id="lmgInlineResult"></div>
+    {% endif %}
+  </div>
+  <!--   <div class="lmg-sample-count small">Dataset rows: <strong id="lmgDatasetCount">0</strong></div> -->
+  <div id="lmg-hubspot-form" style="display:none;">
+    {% form
+    form_to_use="{{ module.select_form.form_id }}"
+    response_response_type="{{ module.select_form.response_type }}"
+    response_message="{{ module.select_form.message }}"
+    response_redirect_id="{{ module.select_form.redirect_id }}"
+    response_redirect_url="{{ module.select_form.redirect_url }}"
+    gotowebinar_webinar_key="{{ module.select_form.gotowebinar_webinar_key }}"
+  %}
+  </div>
+
+</div>
+
+<div class="model-conta">
+  <!-- Modal markup -->
+  <div id="lmgModalBackdrop" class="lmg-modal-backdrop" aria-hidden="true">
+    <div class="lmg-modal" role="dialog" aria-modal="true">
+      <div class="lmg-modal-header">
+        <h4 id="lmgModalTitle">Check Fiber Availability</h4>
+        <button id="lmgCloseModal" class="lmg-close">✕</button>
+      </div>
+      <div class="lmg-subtitle">Start typing street, city, or ZIP. We’ll show matching addresses.</div>
+
+      <div class="lmg-search-row">
+        <div class="lmg-input suggestions">
+          <input id="lmgModalInput" placeholder="{{ module.input_placeholder }}" autocomplete="off" />
+          <div id="lmgDropdown" class="lmg-dropdown" style="display:none"></div>
+        </div>
+        <button class="lmg-btn" id="lmgModalCheck">Check Now</button>
+      </div>
+
+      <div id="lmgModalResult"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Inject normalized HubDB JSON for client -->
+<script type="application/json" id="lmg-hubdb-json">
+  {{ normalized|tojson }}
+</script>
+
+{% require_js %}
+<script defer>
+(function () {
+
+  /* ======================================================
+   0. SHARED STATE
+  ====================================================== */
+  let SELECTED_ADDRESS = null;
+
+  /* ======================================================
+   1. LOAD HUBDB JSON
+  ====================================================== */
+  const raw = document.getElementById("lmg-hubdb-json");
+  let HUBDB = [];
+
+  try {
+    HUBDB = JSON.parse(raw?.textContent || "[]") || [];
+  } catch (e) {
+    console.warn("LMG JSON parse error:", e);
+  }
+
+  /* ======================================================
+   2. NORMALIZATION
+  ====================================================== */
+  const ABBREV = {
+    st: "street",
+    rd: "road",
+    ave: "avenue",
+    blvd: "boulevard",
+    ln: "lane",
+    dr: "drive",
+    hwy: "highway",
+    pkwy: "parkway",
+    pk: "parkway",
+  };
+
+  function normalize(str) {
+    if (!str) return "";
+    let s = str.toString().toLowerCase();
+    s = s.replace(/[.,#]/g, " ");
+    s = s.replace(/\s+/g, " ").trim();
+    return s.split(" ").map(t => ABBREV[t] || t).join(" ");
+  }
+
+  /* ======================================================
+   3. FAST INDEX (O(1))
+  ====================================================== */
+  const INDEX = {};
+
+  function addKey(key, row) {
+    const k = normalize(key);
+    if (k) INDEX[k] = row;
+  }
+
+  HUBDB.forEach(row => {
+    addKey(row.normalizedaddress, row);
+    addKey(row.streetaddress, row);
+    addKey(row.zipcode, row);
+    addKey(`${row.house_number} ${row.streetaddress}`, row);
+    addKey(`${row.city} ${row.state}`, row);
+    addKey(`${row.city} ${row.state} ${row.zipcode}`, row);
+  });
+
+  function fastLookup(q) {
+    return INDEX[normalize(q)] || null;
+  }
+
+  /* ======================================================
+   4. FUZZY SEARCH (ALL STATUSES)
+  ====================================================== */
+  const SEARCH_FIELDS = [
+    "normalizedaddress",
+    "streetaddress",
+    "city",
+    "state",
+    "zipcode",
+  ];
+
+  function scoreRow(row, tokens) {
+    let score = 0;
+    for (const f of SEARCH_FIELDS) {
+      const val = normalize(row[f]);
+      for (const t of tokens) {
+        if (val === t) score += 10;
+        else if (val.startsWith(t)) score += 5;
+        else if (val.includes(t)) score += 2;
+      }
+    }
+    return score;
+  }
+
+  function fuzzySearch(query) {
+    const tokens = normalize(query).split(" ").filter(Boolean);
+    if (!tokens.length) return [];
+
+    return HUBDB
+      .map(row => ({ row, score: scoreRow(row, tokens) }))
+      .filter(r => r.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(r => r.row)
+      .slice(0, 100);
+  }
+
+  /* ======================================================
+   5. UI HELPERS
+  ====================================================== */
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function highlight(text, query) {
+    let t = escapeHtml(text);
+    normalize(query).split(" ").forEach(p => {
+      if (p.length > 1) {
+        t = t.replace(new RegExp(`(${p})`, "ig"), "<mark>$1</mark>");
+      }
+    });
+    return t;
+  }
+
+  function statusBadge(status) {
+    const s = normalize(status);
+    let cls = "lmg-gray";
+
+    if (s.includes("serviceable") || s.includes("connected")) cls = "lmg-green";
+    else if (s.includes("design")) cls = "lmg-blue";
+    else if (s.includes("construction")) cls = "lmg-orange";
+    else if (s.includes("not")) cls = "lmg-red";
+
+    return `<span class="lmg-badge ${cls}">${escapeHtml(status)}</span>`;
+  }
+
+  /* ======================================================
+   6. RENDER RESULTS
+  ====================================================== */
+  function renderResults(matches, query, targetEl) {
+    if (!matches.length) {
+      targetEl.innerHTML = `
+        <div class="lmg-result-card">
+          <strong>No results found</strong>
+          <div class="lmg-muted">Try a more specific address.</div>
+        </div>`;
+      return;
+    }
+
+    targetEl.innerHTML = `
+      <div class="lmg-result-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <strong>Select an address to request our services</strong>
+            <div class="lmg-muted">Found ${matches.length} matching addresses.</div>
+          </div>
+          <button class="lmg-btn lmg-proceed" disabled>Proceed</button>
+        </div>
+
+        <div class="lmg-addresses-list">
+          ${matches.map((m, i) => `
+            <div class="lmg-addr" data-i="${i}">
+              <div style="display:flex;justify-content:space-between;gap:12px;">
+                <strong>
+                  ${highlight(m.normalizedaddress, query)}, ${escapeHtml(m.city)}
+                </strong>
+                ${statusBadge(m.addressstatus)}
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+
+    const rows = targetEl.querySelectorAll(".lmg-addr");
+    const proceedBtn = targetEl.querySelector(".lmg-proceed");
+
+    rows.forEach(r => {
+      r.addEventListener("click", () => {
+        rows.forEach(x => x.classList.remove("selected"));
+        r.classList.add("selected");
+        SELECTED_ADDRESS = matches[r.dataset.i];
+        proceedBtn.disabled = false;
+      });
+    });
+
+    proceedBtn.addEventListener("click", () => showForm(targetEl, SELECTED_ADDRESS));
+  }
+
+  /* ======================================================
+   7. SHOW HUBSPOT FORM (HUBL RENDERED)
+  ====================================================== */
+  function showForm(container, address) {
+    if (!address) return;
+
+    const formWrapper = document.getElementById("lmg-hubspot-form");
+    if (!formWrapper) return;
+
+    container.innerHTML = `
+      <div class="lmg-result-card">
+        <h3>{{ module.form_title }}</h3>
+        <div class="lmg-form-holder"></div>
+      </div>
+    `;
+
+    container.querySelector(".lmg-form-holder").appendChild(formWrapper);
+    formWrapper.style.display = "block";
+
+    setTimeout(() => {
+      const val =
+        `${address.normalizedaddress}, ${address.city}, ${address.state} ${address.zipcode}`;
+      const input =
+        formWrapper.querySelector('input[name="address"], textarea[name="address"]');
+      if (input) input.value = val;
+    }, 100);
+  }
+
+  function resetForm() {
+    const formWrapper = document.getElementById("lmg-hubspot-form");
+    if (formWrapper) formWrapper.style.display = "none";
+  }
+
+  /* ======================================================
+   8. MAIN SEARCH
+  ====================================================== */
+  function handleSearch(query, targetEl) {
+    targetEl.innerHTML =
+      `<div class="lmg-result-card"><div class="lmg-muted">Searching…</div></div>`;
+
+    setTimeout(() => {
+      const exact = fastLookup(query);
+      const matches = exact ? [exact] : fuzzySearch(query);
+      renderResults(matches, query, targetEl);
+    }, 150);
+  }
+
+  /* ======================================================
+   9. INLINE WIRES
+  ====================================================== */
+  const inlineInput = document.getElementById("lmgInlineInput");
+  const inlineBtn = document.getElementById("lmgInlineBtn");
+  const inlineResult = document.getElementById("lmgInlineResult");
+
+  inlineBtn?.addEventListener("click", () =>
+    handleSearch(inlineInput.value, inlineResult)
+  );
+
+  inlineInput?.addEventListener("keydown", e => {
+    if (e.key === "Enter") handleSearch(inlineInput.value, inlineResult);
+  });
+
+  /* ======================================================
+   10. MODAL WIRES (FIXED)
+  ====================================================== */
+  const openBtn = document.getElementById("lmgOpenModal");
+  const modalBackdrop = document.getElementById("lmgModalBackdrop");
+  const closeBtn = document.getElementById("lmgCloseModal");
+  const modalInput = document.getElementById("lmgModalInput");
+  const modalCheck = document.getElementById("lmgModalCheck");
+  const modalResult = document.getElementById("lmgModalResult");
+
+  openBtn?.addEventListener("click", () => {
+    modalBackdrop.style.display = "flex";
+    modalInput.focus();
+  });
+
+  closeBtn?.addEventListener("click", () => {
+    modalBackdrop.style.display = "none";
+    modalResult.innerHTML = "";
+    modalInput.value = "";
+    resetForm();
+  });
+
+  modalBackdrop?.addEventListener("click", e => {
+    if (e.target === modalBackdrop) closeBtn.click();
+  });
+
+  modalCheck?.addEventListener("click", () =>
+    handleSearch(modalInput.value, modalResult)
+  );
+
+})();
+</script>
+
+{% end_require_js %}
+
+{% require_css %}
+<style>
+  .lmg-address-lookup-module.{{name}}{
+    {{ module.style.desktop_spacing.css }}
+  }
+
+  .lmg-badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .model-conta {
+    position: relative;
+    z-index: 99999;
+  }
+
+  .lmg-green { background:#e7f7ec; color:#1a7f37; }
+  .lmg-blue  { background:#e7f0ff; color:#1f4fd8; }
+  .lmg-orange{ background:#fff1e0; color:#b45309; }
+  .lmg-red   { background:#fee2e2; color:#b91c1c; }
+
+  .lmg-addr.selected {
+    outline: 1px solid #22c55e;
+    border-radius: 8px;
+    background: #22c55e47;
+  }
+
+
+  @media(max-width: 767px){
+    .lmg-address-lookup-module.{{name}}{
+      {{ module.style.mobile_spacing.css }}
+    }
+  }
+</style>
+{% end_require_css %}
+
+{% require_css %}
+<style>
+  :root{
+    --primary: #5dbc4a;
+    --secondary: #171940;
+    --tertiary: #ff6e00;
+    --white: #ffffff;
+    --success: #00C2A8;
+    --warning: #FF9B42;
+    --bg: #FBFDFF;
+    --card: #FFFFFF;
+    --text: #0B1220;
+    --muted: #556075;
+    --radius: 12px;
+  }
+
+  /* .lmg-address-lookup-module{max-width:1100px;margin:0 auto;padding:22px;background:transparent;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;} */
+  .lmg-hero{display:flex;justify-content:space-between;align-items:center;gap:18px;}
+  .lmg-title{margin:0;font-size:18px;font-weight:700;}
+  .lmg-muted{font-size:13px;color:var(--muted);margin-top:6px;}
+
+  .lmg-btn{
+    background:var(--primary);
+    color:#fff;
+    padding: 15px 21px;
+    border-radius: 5px;
+    border:0;
+    font-weight:600;
+    cursor:pointer;
+    box-shadow:0 8px 24px rgba(0,108,255,0.12);
+    cursor: pointer;
+  }
+
+  .lmg-btn.lmg-btn.pwr-cta_button:before,
+  .lmg-btn.lmg-btn.pwr-cta_button:after{
+    display: none;
+  }
+
+  .{{name}} .custom-btn.lmg-btn{
+    background:var(--{{ module.choose_button_style }});
+    {% if  module.choose_button_style == "white" %}
+    color: var(--secondary);
+    {% endif %}
+  }
+
+  .{{name}}  .buttons {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    {% if module.buttons.change_position_to_second %}
+    flex-direction: row-reverse;
+    {% endif %}
+  }
+
+  .{{name}} .lmg-btn.first-btn{
+    background:var(--{{ module.buttons.choose_button_style }});
+    {% if  module.buttons.choose_button_style == "white" %}
+    color: var(--secondary);
+    {% else %}
+    color: var(--white);
+    {% endif %}
+  }
+
+  .lmg-btn:hover {
+    background: #37761D;
+  }
+
+  .{{name}} .custom-btn.lmg-btn:hover{
+    background: hsl(from var(--{{ module.choose_button_style }}) h s l / 0.8);
+    {% if  module.choose_button_style == "white" %}
+    color: var(--secondary);
+    {% endif %}
+  }
+
+  .{{name}} .lmg-btn.first-btn:hover{
+    background: hsl(from var(--{{ module.buttons.choose_button_style }}) h s l / 0.8);
+    {% if module.buttons.choose_button_style =="white" %}
+    color: var(--secondary);
+    {% endif %}
+  }
+
+  .lmg-btn:active{
+    transform:translateY(1px);
+  }
+
+  .lmg-inline-search{
+    display:flex;
+    gap:12px;
+    align-items:center;
+    margin-top:18px;
+  }
+
+  .lmg-input{
+    flex:1;
+  }
+
+  {% if module.choose_alignment %}
+  .lmg-inline-search{
+    display:flex; 
+    gap:12px;
+    margin-top:18px;
+    flex-direction: column;
+    align-items: self-start;     
+  }
+
+  .lmg-input{
+    width: 100%;
+  }
+  {% endif %}
+
+  .lmg-input input{
+    width: 100%;
+    outline: none;
+    font-size: 16px;
+    background: var(--card);
+    border: 1px solid rgba(9, 23, 46, 0.06);
+    padding: 12px 21px;
+    border-radius: 5px;
+    box-shadow: 0 6px 18px rgba(10, 20, 40, 0.04);
+  }
+
+  .lmg-sample-count{margin-top:14px;color:var(--muted);font-size:13px;}
+
+  /* result card */
+  .lmg-result-card{margin-top:14px;padding:14px;border-radius:12px;background:var(--card);box-shadow:0 8px 24px rgba(10,20,40,0.06);border-left:6px solid rgba(0,0,0,0.04);}
+  .lmg-available{border-left-color:var(--success);}
+  .lmg-not-available{border-left-color:var(--warning);}
+  .lmg-muted{color:var(--muted);font-size:13px;}
+
+  /* modal */
+  .lmg-modal-backdrop{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(6,12,28,0.45);z-index:999;padding:20px;}
+  .lmg-modal{
+    width:720px;
+    max-width:100%;
+    background:var(--card);
+    border-radius:14px;
+    padding:20px;
+    box-shadow:0 30px 80px rgba(8,12,40,0.3);
+    position: relative;
+    left: 0%;
+    top: 0%;
+    height: max-content;
+    overflow: auto;
+  }
+  .lmg-modal-header{display:flex;justify-content:space-between;align-items:center;}
+  .lmg-close{background:transparent;border:0;font-size:18px;cursor:pointer;}
+  .lmg-subtitle{color:var(--muted);font-size:13px;margin:8px 0 14px;}
+  .lmg-search-row{display:flex;gap:10px;align-items:center;}
+  .suggestions{position:relative;}
+  .lmg-dropdown{position:absolute;left:0;right:0;background:#fff;border-radius:10px;margin-top:8px;box-shadow:0 12px 40px rgba(12,20,40,0.08);max-height:240px;overflow:auto;border:1px solid rgba(9,23,46,0.04);}
+  .lmg-dropdown .lmg-item{padding:10px;border-bottom:1px solid rgba(9,23,46,0.03);cursor:pointer;}
+  .lmg-dropdown .lmg-item:last-child{border-bottom:0;}
+  .lmg-addresses-list{margin-top:12px;max-height:260px;overflow:auto;border-radius:8px;border:1px solid rgba(9,23,46,0.03);}
+  .lmg-addresses-list .lmg-addr{padding:10px 12px;border-bottom:1px dashed rgba(9,23,46,0.04);}
+  .lmg-addresses-list .lmg-addr:last-child{border-bottom:0;}
+
+  @media(max-width:720px){
+    .lmg-modal{width:100%;}
+    .lmg-hero{flex-direction:column;align-items:flex-start;gap:8px;}
+  }
+
+</style>
+{% end_require_css %}
